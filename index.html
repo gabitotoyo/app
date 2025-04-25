@@ -1,0 +1,286 @@
+<!DOCTYPE html>
+<html>
+<head>
+  <meta charset="UTF-8">
+  <title>Análisis Dólar Informal Cubano</title>
+  <script src="https://cdn.plot.ly/plotly-2.27.0.min.js"></script>
+  <style>
+    body { font-family: Arial, sans-serif; max-width: 1200px; margin: 0 auto; padding: 20px; }
+    .form-group { margin: 20px 0; display: flex; gap: 20px; align-items: center; flex-wrap: wrap; }
+    input[type="number"] { padding: 8px; width: 150px; }
+    button { padding: 8px 20px; background: #007bff; color: white; border: none; cursor: pointer; }
+    .resultados, .leyenda { background: #f8f9fa; padding: 20px; margin-top: 20px; border-radius: 5px; }
+    .metricas { display: grid; grid-template-columns: repeat(auto-fit, minmax(250px, 1fr)); gap: 20px; }
+    .metrica { background: white; padding: 15px; border-radius: 5px; box-shadow: 0 2px 4px rgba(0,0,0,0.1); }
+    .highlight { color: #28a745; font-weight: bold; }
+    .boton-detalles { margin-top: 20px; }
+  </style>
+</head>
+<body>
+  <h1>Inversión en Dólar Informal Cubano</h1>
+
+  <div class="form-group">
+    <div>
+      <label>Capital Disponible (USD): </label>
+      <input type="number" id="capital" value="1000" min="1">
+    </div>
+    <div>
+      <label>Meses de inversión: </label>
+      <input type="number" id="meses" value="1" min="1">
+    </div>
+    <button onclick="actualizarDatos()">Calcular</button>
+  </div>
+
+  <div id="resultados" class="resultados" style="display:none;"></div>
+  <div id="grafico"></div>
+  <div class="boton-detalles" style="text-align: center; margin-top: 20px;">
+    <button onclick="window.location.href='graficos.html'">Ver gráficos detallados</button>
+  </div>
+
+
+  <div class="leyenda">
+    <p>Leyenda del gráfico:</p>
+    <ul>
+      <li><span style="color: #1f77b4">●</span> Precio actual</li>
+      <li><span style="color: rgba(255, 0, 0, 0.3)">—</span> Banda Bollinger Superior</li>
+      <li><span style="color: rgba(0, 255, 0, 0.3)">—</span> Banda Bollinger Inferior</li>
+      <li><span style="color: orange">···</span> Media Móvil 30 días</li>
+      <li><span style="color: purple">···</span> Media Móvil 200 días</li>
+      <li>▲ Verde: Señal de compra</li>
+      <li>▼ Rojo: Señal de venta</li>
+    </ul>
+  </div>
+
+  <script>
+    async function actualizarDatos() {
+      const capital = parseFloat(document.getElementById("capital").value);
+      const meses = parseInt(document.getElementById("meses").value);
+      await obtenerYProcesarDatos(capital, meses);
+    }
+
+    async function obtenerYProcesarDatos(capital, meses) {
+      const fechaHoy = new Date().toISOString().split("T")[0];
+      const url = `https://api.cambiocuba.money/api/v1/x-rates-by-date-range-history?trmi=true&cur=USD&date_from=2021-01-01+00:00:00&date_to=${fechaHoy}+23:59:59`;
+
+      try {
+        const response = await fetch(url);
+        const data = await response.json();
+        const procesados = procesarDatos(data);
+        if (procesados.length < 30) {
+          document.getElementById("grafico").innerHTML = "<p>No hay suficientes datos para graficar.</p>";
+          return;
+        }
+
+        const df = calcularIndicadores(procesados);
+        const analisis = simularMonteCarlo(df, capital, meses);
+        mostrarResultados(analisis);
+        dibujarGrafico(df);
+
+      } catch (err) {
+        console.error("Error al obtener datos:", err);
+        document.getElementById("grafico").innerHTML = "<p>Error al cargar datos</p>";
+      }
+    }
+
+    function procesarDatos(data) {
+      return data
+        .map(d => {
+          const fecha = d._id;
+          const valor = parseFloat((typeof d.median === 'string' ? d.median.split("JS:")[0] : d.median));
+          return isNaN(valor) ? null : { fecha: new Date(fecha), CUPs: valor };
+        })
+        .filter(d => d !== null)
+        .sort((a, b) => a.fecha - b.fecha);
+    }
+
+    function calcularIndicadores(df) {
+      function mediaMovil(arr, n) {
+        return arr.map((_, i) => {
+          const valores = arr.slice(Math.max(0, i - n + 1), i + 1).map(d => d.CUPs);
+          const suma = valores.reduce((a, b) => a + b, 0);
+          return suma / valores.length;
+        });
+      }
+
+      const sma30 = mediaMovil(df, 30);
+      const sma200 = mediaMovil(df, 200);
+      const sma20 = mediaMovil(df, 20);
+
+      const std20 = df.map((_, i) => {
+        const slice = df.slice(Math.max(0, i - 19), i + 1).map(d => d.CUPs);
+        const mean = slice.reduce((a, b) => a + b, 0) / slice.length;
+        const std = Math.sqrt(slice.reduce((sum, val) => sum + Math.pow(val - mean, 2), 0) / slice.length);
+        return std;
+      });
+
+      return df.map((d, i) => {
+        const upper = sma20[i] + 2 * std20[i];
+        const lower = sma20[i] - 2 * std20[i];
+        const cruce = sma30[i] > sma200[i] ? 1 : -1;
+        const señal = i > 0 ? cruce - (sma30[i - 1] > sma200[i - 1] ? 1 : -1) : 0;
+        return { ...d, SMA30: sma30[i], SMA200: sma200[i], SMA20: sma20[i], UpperBB: upper, LowerBB: lower, Señal: señal };
+      });
+    }
+
+    function simularMonteCarlo(df, capital, meses) {
+      const mensual = {};
+      df.forEach(d => {
+        const mes = d.fecha.getFullYear() + "-" + (d.fecha.getMonth() + 1);
+        mensual[mes] = d;
+      });
+
+      const precios = Object.values(mensual).map(d => d.CUPs);
+      const retornos = [];
+      for (let i = 1; i < precios.length; i++) {
+        retornos.push((precios[i] - precios[i - 1]) / precios[i - 1]);
+      }
+
+      const mu = retornos.reduce((a, b) => a + b, 0) / retornos.length;
+      const sigma = Math.sqrt(retornos.map(r => (r - mu) ** 2).reduce((a, b) => a + b, 0) / retornos.length);
+
+      const sims = 100000;
+      let simRetornos = new Array(sims).fill(0);
+      for (let m = 0; m < meses; m++) {
+        const mensual = Array.from({ length: sims }, () => (Math.random() * sigma * 2 - sigma) + mu);
+        simRetornos = simRetornos.map((r, i) => (1 + r) * (1 + mensual[i]) - 1);
+      }
+
+      const probSubida = simRetornos.filter(r => r > 0).length / sims * 100;
+      const probBajada = 100 - probSubida;
+      const rentEsperada = simRetornos.reduce((a, b) => a + b, 0) / sims * 100;
+      const utilidades = capital * rentEsperada / 100;
+
+      let accion = "MANTENER";
+      let inversion = 0;
+      if (probSubida > 60) {
+        accion = "COMPRAR";
+        inversion = capital * 0.7;
+      } else if (probBajada > 40) {
+        accion = "VENDER";
+        inversion = capital * 0.5;
+      }
+
+      return {
+        precio_actual: df[df.length - 1].CUPs.toFixed(2),
+        prob_subida: probSubida.toFixed(1),
+        prob_bajada: probBajada.toFixed(1),
+        rent_esperada: rentEsperada.toFixed(2),
+        utilidades: utilidades.toFixed(2),
+        accion,
+        inversion: inversion.toFixed(2),
+        var_95: (simRetornos.sort()[Math.floor(0.05 * sims)] * 100).toFixed(1),
+        mejor_escenario: (simRetornos.sort()[Math.floor(0.95 * sims)] * 100).toFixed(1),
+        mu: (mu * 100).toFixed(2),
+        sigma: (sigma * 100).toFixed(2),
+        meses
+      };
+    }
+
+    function mostrarResultados(analisis) {
+      document.getElementById("resultados").style.display = "block";
+      document.getElementById("resultados").innerHTML = `
+        <h2>Recomendación para ${analisis.meses} mes${analisis.meses > 1 ? "es" : ""}</h2>
+        <div class="metricas">
+          <div class="metrica">
+            <h3>Se Recomienda</h3>
+            <p style="font-size: 24px; color: ${analisis.accion === "COMPRAR" ? "#28a745" : "#dc3545"};">
+              ${analisis.accion} $${analisis.inversion}
+            </p>
+          </div>
+          <div class="metrica">
+            <h3>Rentabilidad Esperada</h3>
+            <p class="highlight">${analisis.rent_esperada}%</p>
+            <p>Utilidades estimadas: $${analisis.utilidades}</p>
+          </div>
+          <div class="metrica">
+            <h3>Riesgos</h3>
+            <p>Peor caso (95%): ${analisis.var_95}%</p>
+            <p>Mejor caso: ${analisis.mejor_escenario}%</p>
+          </div>
+          <div class="metrica">
+            <h3>Precio Actual</h3>
+            <p>${analisis.precio_actual} CUP/USD</p>
+          </div>
+          <div class="metrica">
+            <h3>Volatilidad Mensual</h3>
+            <p>${analisis.sigma}%</p>
+          </div>
+          <div class="metrica">
+            <h3>Tendencia Histórica</h3>
+            <p>${analisis.mu}% mensual</p>
+          </div>
+        </div>
+      `;
+    }
+
+    function dibujarGrafico(df) {
+      const fechas = df.map(d => d.fecha);
+      Plotly.newPlot("grafico", [
+        {
+          x: fechas,
+          y: df.map(d => d.CUPs),
+          type: "scatter",
+          name: "Precio",
+          line: { color: "#1f77b4" }
+        },
+        {
+          x: fechas,
+          y: df.map(d => d.UpperBB),
+          type: "scatter",
+          name: "Banda Superior",
+          line: { color: "rgba(255,0,0,0.3)", width: 1 }
+        },
+        {
+          x: fechas,
+          y: df.map(d => d.LowerBB),
+          type: "scatter",
+          name: "Banda Inferior",
+          line: { color: "rgba(0,255,0,0.3)", width: 1 },
+          fill: "tonexty",
+          fillcolor: "rgba(100,100,100,0.1)"
+        },
+        {
+          x: fechas,
+          y: df.map(d => d.SMA30),
+          type: "scatter",
+          name: "SMA30",
+          line: { dash: "dot", color: "orange" }
+        },
+        {
+          x: fechas,
+          y: df.map(d => d.SMA200),
+          type: "scatter",
+          name: "SMA200",
+          line: { dash: "dot", color: "purple" }
+        },
+        {
+          x: df.filter(d => d.Señal === 2).map(d => d.fecha),
+          y: df.filter(d => d.Señal === 2).map(d => d.CUPs),
+          type: "scatter",
+          mode: "markers",
+          marker: { symbol: "triangle-up", size: 10, color: "green" },
+          name: "Compra"
+        },
+        {
+          x: df.filter(d => d.Señal === -2).map(d => d.fecha),
+          y: df.filter(d => d.Señal === -2).map(d => d.CUPs),
+          type: "scatter",
+          mode: "markers",
+          marker: { symbol: "triangle-down", size: 10, color: "red" },
+          name: "Venta"
+        }
+      ], {
+        title: "Análisis Técnico del Dólar Informal",
+        height: 600
+      });
+    }
+
+    // Cargar el gráfico al iniciar
+    window.addEventListener("load", () => {
+      const capital = parseFloat(document.getElementById("capital").value);
+      const meses = parseInt(document.getElementById("meses").value);
+      obtenerYProcesarDatos(capital, meses);
+    });
+  </script>
+</body>
+</html>

@@ -1,0 +1,269 @@
+<!DOCTYPE html>
+<html lang="es">
+<head>
+    <meta charset="UTF-8">
+    <title>Monitor Dólar Cuba</title>
+    <script src="https://cdn.plot.ly/plotly-2.27.0.min.js"></script>
+    <style>                          
+        body {
+            font-family: 'Arial', sans-serif;
+            margin: 0;
+            padding: 20px;
+            background: #f5f5f5;
+        }
+        
+        .container {
+            max-width: 1280px;
+            margin: 0 auto;
+            background: white;
+            padding: 20px;
+            border-radius: 8px;
+            box-shadow: 0 2px 4px rgba(0,0,0,0.1);
+        }
+        
+        .controls {
+            margin-bottom: 20px;
+            display: flex;
+            gap: 15px;
+            align-items: center;
+        }
+        
+        button {
+            background: #4CAF50;
+            color: white;
+            border: none;
+            padding: 10px 20px;
+            border-radius: 4px;
+            cursor: pointer;
+            font-weight: bold;
+        }
+        
+        .status {
+            color: #2196F3;
+            font-size: 0.9em;
+        }
+        
+        .chart {
+            margin-bottom: 30px;
+            background: white;
+            padding: 15px;
+            border-radius: 8px;
+        }
+    </style>
+</head>
+<body>
+    <div class="container">
+        <div class="controls">
+            <button onclick="actualizarDatos()">Actualizar Datos</button>
+            <div class="status" id="estado">Cargando datos iniciales...</div>
+        </div>
+
+        <!-- Botón de regreso a index.html -->
+        <div class="controls">
+            <button onclick="window.location.href='index.html'">Volver al Análisis</button>
+        </div>
+
+        <div id="mainChart" class="chart"></div>
+        <div id="rsiChart" class="chart"></div>
+        <div id="macdChart" class="chart"></div>
+        <div id="volatilityChart" class="chart"></div>
+    </div>
+
+    <script>
+        let datos = [];
+        const API_URL = "https://api.cambiocuba.money/api/v1/x-rates-by-date-range-history?trmi=true&cur=USD";
+
+        async function actualizarDatos() {
+            try {
+                setEstado('Actualizando datos...', '#2196F3');
+                const fechaActual = new Date();
+                const fechaFormateada = formatDate(fechaActual);
+                const url = `${API_URL}&date_from=2021-01-01+00:00:00&date_to=${fechaFormateada}+23:59:59`;
+                const response = await fetch(url);
+                if (!response.ok) throw new Error(`Error en la respuesta de la API: ${response.statusText}`);
+                const rawData = await response.json();
+                datos = procesarDatos(rawData);
+                calcularIndicadores();
+                dibujarGraficos();
+                setEstado(`Datos actualizados: ${new Date().toLocaleString()}`, '#4CAF50');
+            } catch (error) {
+                console.error('Error:', error);
+                setEstado(`Error: ${error.message}`, '#f44336');
+            }
+        }
+
+        function formatDate(date) {
+            const year = date.getFullYear();
+            const month = String(date.getMonth() + 1).padStart(2, '0');
+            const day = String(date.getDate()).padStart(2, '0');
+            return `${year}-${month}-${day}`;
+        }
+
+        function procesarDatos(rawData) {
+            return rawData.map(item => {
+                const fecha = new Date(item._id);
+                const median = (typeof item.median === 'string' && item.median.includes('JS:')) 
+                    ? parseFloat(item.median.split('JS:')[0]) 
+                    : (typeof item.median === 'number' ? item.median : 0);
+                return { fecha, CUPs: median };
+            }).sort((a, b) => a.fecha - b.fecha);
+        }
+
+        function calcularIndicadores() {
+            datos.forEach((d, i) => {
+                d.SMA30 = mediaMovil(i, 30);
+                d.SMA200 = mediaMovil(i, 200);
+            });
+
+            const rsiPeriod = 14;
+            const gains = [], losses = [];
+            datos.forEach((d, i) => {
+                const change = i > 0 ? d.CUPs - datos[i-1].CUPs : 0;
+                gains.push(change > 0 ? change : 0);
+                losses.push(change < 0 ? Math.abs(change) : 0);
+                if(i >= rsiPeriod) {
+                    const avgGain = gains.slice(-rsiPeriod).reduce((a,b) => a + b, 0) / rsiPeriod;
+                    const avgLoss = losses.slice(-rsiPeriod).reduce((a,b) => a + b, 0) / rsiPeriod;
+                    d.RSI = 100 - (100 / (1 + (avgGain / avgLoss)));
+                }
+            });
+
+            datos.forEach((d, i) => {
+                d.EMA12 = ema(i, 12);
+                d.EMA26 = ema(i, 26);
+                d.MACD = d.EMA12 - d.EMA26;
+                d.Signal = emaMacd(i, 9);
+            });
+
+            const bbPeriod = 20;
+            datos.forEach((d, i) => {
+                if(i >= bbPeriod) {
+                    const slice = datos.slice(i - bbPeriod, i);
+                    const mean = slice.reduce((a,b) => a + b.CUPs, 0) / bbPeriod;
+                    const std = Math.sqrt(slice.reduce((a,b) => a + Math.pow(b.CUPs - mean, 2), 0) / bbPeriod);
+                    d.UpperBB = mean + 2 * std;
+                    d.LowerBB = mean - 2 * std;
+                }
+            });
+        }
+
+        function mediaMovil(index, period) {
+            const start = Math.max(0, index - period + 1);
+            const slice = datos.slice(start, index + 1);
+            return slice.reduce((a,b) => a + b.CUPs, 0) / slice.length;
+        }
+
+        function ema(index, period) {
+            if(index === 0) return datos[0].CUPs;
+            const k = 2 / (period + 1);
+            return datos[index].CUPs * k + datos[index-1].EMA12 * (1 - k);
+        }
+
+        function emaMacd(index, period) {
+            if(index === 0) return datos[0].MACD;
+            const k = 2 / (period + 1);
+            return datos[index].MACD * k + datos[index-1].Signal * (1 - k);
+        }
+
+        function dibujarGraficos() {
+            const fechas = datos.map(d => d.fecha);
+
+            Plotly.newPlot('mainChart', [{
+                x: fechas,
+                y: datos.map(d => d.CUPs),
+                name: 'Precio',
+                line: {color: '#1f77b4'}
+            }, {
+                x: fechas,
+                y: datos.map(d => d.SMA30),
+                name: 'SMA 30',
+                line: {dash: 'dot', color: 'orange'}
+            }, {
+                x: fechas,
+                y: datos.map(d => d.SMA200),
+                name: 'SMA 200',
+                line: {dash: 'dot', color: 'purple'}
+            }, {
+                x: fechas,
+                y: datos.map(d => d.UpperBB),
+                name: 'Banda Superior',
+                line: {color: 'gray', width: 1},
+                showlegend: false
+            }, {
+                x: fechas,
+                y: datos.map(d => d.LowerBB),
+                name: 'Banda Inferior',
+                line: {color: 'gray', width: 1},
+                fill: 'tonexty'
+            }], {
+                title: 'Evolución del Dólar Informal en Cuba',
+                plot_bgcolor: 'white',
+                showlegend: true
+            });
+
+            Plotly.newPlot('rsiChart', [{
+                x: fechas,
+                y: datos.map(d => d.RSI),
+                name: 'RSI',
+                line: {color: '#ff7f0e'}
+            }], {
+                title: 'RSI',
+                plot_bgcolor: 'white',
+                shapes: [{
+                    type: 'line',
+                    y0: 70,
+                    y1: 70,
+                    x0: fechas[0],
+                    x1: fechas[fechas.length-1],
+                    line: {color: 'red', dash: 'dot'}
+                }, {
+                    type: 'line',
+                    y0: 30,
+                    y1: 30,
+                    x0: fechas[0],
+                    x1: fechas[fechas.length-1],
+                    line: {color: 'green', dash: 'dot'}
+                }]
+            });
+
+            Plotly.newPlot('macdChart', [{
+                x: fechas,
+                y: datos.map(d => d.MACD),
+                name: 'MACD',
+                line: {color: '#2ca02c'}
+            }, {
+                x: fechas,
+                y: datos.map(d => d.Signal),
+                name: 'Señal',
+                line: {color: '#d62728'}
+            }], {
+                title: 'MACD',
+                plot_bgcolor: 'white'
+            });
+
+            const volatilidad = datos.map((d, i) => 
+                i > 0 ? Math.abs((d.CUPs - datos[i-1].CUPs) / datos[i-1].CUPs * 100) : 0
+            );
+            Plotly.newPlot('volatilityChart', [{
+                x: fechas,
+                y: volatilidad,
+                type: 'bar',
+                name: 'Volatilidad',
+                marker: {color: '#17becf'}
+            }], {
+                title: 'Volatilidad Diaria (%)',
+                plot_bgcolor: 'white'
+            });
+        }
+
+        function setEstado(texto, color) {
+            const estado = document.getElementById('estado');
+            estado.textContent = texto;
+            estado.style.color = color;
+        }
+
+        actualizarDatos();
+        setInterval(actualizarDatos, 300000);
+    </script>
+</body>
+</html>
